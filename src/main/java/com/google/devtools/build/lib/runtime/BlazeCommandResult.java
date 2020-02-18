@@ -14,10 +14,13 @@
 
 package com.google.devtools.build.lib.runtime;
 
+import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.Immutable;
 import com.google.devtools.build.lib.server.CommandProtos.ExecRequest;
+import com.google.devtools.build.lib.server.FailureDetails.FailureDetail;
 import com.google.devtools.build.lib.util.ExitCode;
+import com.google.devtools.build.lib.util.FailureDetailUtil;
 import javax.annotation.Nullable;
 
 /**
@@ -27,12 +30,17 @@ import javax.annotation.Nullable;
 @Immutable
 public final class BlazeCommandResult {
   private final ExitCode exitCode;
-  @Nullable
-  private final ExecRequest execDescription;
+  @Nullable private final FailureDetail failureDetail;
+  @Nullable private final ExecRequest execDescription;
   private final boolean shutdown;
 
-  private BlazeCommandResult(ExitCode exitCode, ExecRequest execDescription, boolean shutdown) {
+  private BlazeCommandResult(
+      ExitCode exitCode,
+      @Nullable FailureDetail failureDetail,
+      ExecRequest execDescription,
+      boolean shutdown) {
     this.exitCode = Preconditions.checkNotNull(exitCode);
+    this.failureDetail = failureDetail;
     this.execDescription = execDescription;
     this.shutdown = shutdown;
   }
@@ -41,24 +49,45 @@ public final class BlazeCommandResult {
     return exitCode;
   }
 
+  @Nullable
+  public FailureDetail getFailureDetail() {
+    return failureDetail;
+  }
+
   public boolean shutdown() {
     return shutdown;
   }
 
-  public static BlazeCommandResult shutdown(ExitCode exitCode) {
-    return new BlazeCommandResult(exitCode, null, true);
-  }
-
-  @Nullable public ExecRequest getExecRequest() {
+  @Nullable
+  public ExecRequest getExecRequest() {
     return execDescription;
   }
 
+  @Override
+  public String toString() {
+    return MoreObjects.toStringHelper(this)
+        .add("exitCode", exitCode)
+        .add("failureDetail", failureDetail)
+        .add("execDescription", execDescription)
+        .add("shutdown", shutdown)
+        .toString();
+  }
+
+  public static BlazeCommandResult shutdown(ExitCode exitCode) {
+    return new BlazeCommandResult(exitCode, null, null, true);
+  }
+
   public static BlazeCommandResult exitCode(ExitCode exitCode) {
-    return new BlazeCommandResult(exitCode, null, false);
+    return new BlazeCommandResult(exitCode, null, null, false);
+  }
+
+  public static BlazeCommandResult failureDetail(FailureDetail failureDetail) {
+    return new BlazeCommandResult(
+        FailureDetailUtil.getExitCode(failureDetail), failureDetail, null, false);
   }
 
   public static BlazeCommandResult execute(ExecRequest execDescription) {
     return new BlazeCommandResult(
-        ExitCode.SUCCESS, Preconditions.checkNotNull(execDescription), false);
+        ExitCode.SUCCESS, null, Preconditions.checkNotNull(execDescription), false);
   }
 }

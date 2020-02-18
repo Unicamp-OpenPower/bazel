@@ -56,19 +56,22 @@ import com.google.devtools.build.lib.skylarkbuildapi.stubs.ProviderStub;
 import com.google.devtools.build.lib.skylarkbuildapi.stubs.SkylarkAspectStub;
 import com.google.devtools.build.lib.skylarkbuildapi.test.TestingBootstrap;
 import com.google.devtools.build.lib.syntax.BaseFunction;
+import com.google.devtools.build.lib.syntax.Dict;
 import com.google.devtools.build.lib.syntax.EvalException;
 import com.google.devtools.build.lib.syntax.EvalUtils;
+import com.google.devtools.build.lib.syntax.Expression;
+import com.google.devtools.build.lib.syntax.ExpressionStatement;
 import com.google.devtools.build.lib.syntax.LoadStatement;
-import com.google.devtools.build.lib.syntax.MethodLibrary;
+import com.google.devtools.build.lib.syntax.Module;
 import com.google.devtools.build.lib.syntax.Mutability;
 import com.google.devtools.build.lib.syntax.ParserInput;
-import com.google.devtools.build.lib.syntax.Runtime;
+import com.google.devtools.build.lib.syntax.Starlark;
+import com.google.devtools.build.lib.syntax.StarlarkCallable;
 import com.google.devtools.build.lib.syntax.StarlarkFile;
 import com.google.devtools.build.lib.syntax.StarlarkFunction;
 import com.google.devtools.build.lib.syntax.StarlarkSemantics;
 import com.google.devtools.build.lib.syntax.StarlarkThread;
 import com.google.devtools.build.lib.syntax.StarlarkThread.Extension;
-import com.google.devtools.build.lib.syntax.StarlarkThread.GlobalFrame;
 import com.google.devtools.build.lib.syntax.Statement;
 import com.google.devtools.build.lib.syntax.StringLiteral;
 import com.google.devtools.build.skydoc.fakebuildapi.FakeActionsInfoProvider;
@@ -108,6 +111,7 @@ import com.google.devtools.build.skydoc.fakebuildapi.proto.FakeProtoInfoApiProvi
 import com.google.devtools.build.skydoc.fakebuildapi.proto.FakeProtoModule;
 import com.google.devtools.build.skydoc.fakebuildapi.python.FakePyInfo.FakePyInfoProvider;
 import com.google.devtools.build.skydoc.fakebuildapi.python.FakePyRuntimeInfo.FakePyRuntimeInfoProvider;
+import com.google.devtools.build.skydoc.fakebuildapi.python.FakePyStarlarkTransitions;
 import com.google.devtools.build.skydoc.fakebuildapi.repository.FakeRepositoryModule;
 import com.google.devtools.build.skydoc.fakebuildapi.test.FakeAnalysisFailureInfoProvider;
 import com.google.devtools.build.skydoc.fakebuildapi.test.FakeAnalysisTestResultInfoProvider;
@@ -122,7 +126,6 @@ import com.google.devtools.build.skydoc.rendering.proto.StardocOutputProtos.Aspe
 import com.google.devtools.build.skydoc.rendering.proto.StardocOutputProtos.ProviderInfo;
 import com.google.devtools.build.skydoc.rendering.proto.StardocOutputProtos.RuleInfo;
 import com.google.devtools.common.options.OptionsParser;
-import com.google.devtools.skylark.common.DocstringUtils;
 import java.io.BufferedOutputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -226,6 +229,7 @@ public class SkydocMain {
               aspectInfoMap,
               moduleDocMap);
     } catch (StarlarkEvaluationException exception) {
+      exception.printStackTrace();
       System.err.println("Stardoc documentation generation failed: " + exception.getMessage());
       System.exit(1);
     }
@@ -394,10 +398,12 @@ public class SkydocMain {
   private static String getModuleDoc(StarlarkFile buildFileAST) {
     ImmutableList<Statement> fileStatements = buildFileAST.getStatements();
     if (!fileStatements.isEmpty()) {
-      Statement moduleComment = fileStatements.get(0);
-      StringLiteral moduleDocLiteral = DocstringUtils.getStringLiteral(moduleComment);
-      if (moduleDocLiteral != null) {
-        return moduleDocLiteral.getValue();
+      Statement stmt = fileStatements.get(0);
+      if (stmt instanceof ExpressionStatement) {
+        Expression expr = ((ExpressionStatement) stmt).getExpression();
+        if (expr instanceof StringLiteral) {
+          return ((StringLiteral) expr).getValue();
+        }
       }
     }
     return "";
@@ -421,7 +427,7 @@ public class SkydocMain {
       List<AspectInfoWrapper> aspectInfoList,
       ImmutableMap.Builder<Label, String> moduleDocMap)
       throws InterruptedException, IOException, LabelSyntaxException, StarlarkEvaluationException {
-    Path path = pathOfLabel(label);
+    Path path = pathOfLabel(label, semantics);
 
     if (pending.contains(path)) {
       throw new StarlarkEvaluationException("cycle with " + path);
@@ -456,7 +462,8 @@ public class SkydocMain {
           throw new StarlarkEvaluationException(
               String.format(
                   "File %s imported '%s', yet %s was not found, even at roots %s.",
-                  path, module, pathOfLabel(relativeLabel), depRoots));
+                  path, module, pathOfLabel(relativeLabel, semantics), depRoots),
+              noSuchFileException);
         }
       }
     }
@@ -470,10 +477,11 @@ public class SkydocMain {
     return thread;
   }
 
-  private Path pathOfLabel(Label label) {
+  private Path pathOfLabel(Label label, StarlarkSemantics semantics) {
     String workspacePrefix = "";
-    if (!label.getWorkspaceRoot().isEmpty() && !label.getWorkspaceName().equals(workspaceName)) {
-      workspacePrefix = label.getWorkspaceRoot() + "/";
+    if (!label.getWorkspaceRoot(semantics).isEmpty()
+        && !label.getWorkspaceName().equals(workspaceName)) {
+      workspacePrefix = label.getWorkspaceRoot(semantics) + "/";
     }
 
     return Paths.get(workspacePrefix + label.toPathFragment());
@@ -503,15 +511,15 @@ public class SkydocMain {
     StarlarkThread thread =
         createStarlarkThread(
             semantics,
-            eventHandler,
             globalFrame(ruleInfoList, providerInfoList, aspectInfoList),
             imports);
+    Module module = thread.getGlobals();
 
     try {
-      EvalUtils.exec(file, thread);
+      EvalUtils.exec(file, module, thread);
     } catch (EvalException | InterruptedException ex) {
       // This exception class seems a bit unnecessary. Replace with EvalException?
-      throw new StarlarkEvaluationException("Starlark evaluation error");
+      throw new StarlarkEvaluationException("Starlark evaluation error", ex);
     }
 
     thread.mutability().freeze();
@@ -527,7 +535,7 @@ public class SkydocMain {
    * @param providerInfoList the list of {@link ProviderInfo} objects, to which provider()
    *     invocation information will be added
    */
-  private static GlobalFrame globalFrame(
+  private static Module globalFrame(
       List<RuleInfoWrapper> ruleInfoList,
       List<ProviderInfoWrapper> providerInfoList,
       List<AspectInfoWrapper> aspectInfoList) {
@@ -578,7 +586,10 @@ public class SkydocMain {
             new SkylarkAspectStub(),
             new ProviderStub());
     PyBootstrap pyBootstrap =
-        new PyBootstrap(new FakePyInfoProvider(), new FakePyRuntimeInfoProvider());
+        new PyBootstrap(
+            new FakePyInfoProvider(),
+            new FakePyRuntimeInfoProvider(),
+            new FakePyStarlarkTransitions());
     RepositoryBootstrap repositoryBootstrap =
         new RepositoryBootstrap(new FakeRepositoryModule(ruleInfoList));
     TestingBootstrap testingBootstrap =
@@ -590,8 +601,29 @@ public class SkydocMain {
 
     ImmutableMap.Builder<String, Object> envBuilder = ImmutableMap.builder();
 
-    Runtime.addConstantsToBuilder(envBuilder);
-    MethodLibrary.addBindingsToBuilder(envBuilder);
+    envBuilder.putAll(Starlark.UNIVERSE);
+
+    // Declare a fake implementation of select that just returns the first
+    // value in the dict. (This program is forbidden from depending on the real
+    // implementation of 'select' in lib.packages, and so the hacks multiply.)
+    envBuilder.put(
+        "select",
+        new StarlarkCallable() {
+          @Override
+          public Object fastcall(StarlarkThread thread, Object[] positional, Object[] named)
+              throws EvalException {
+            for (Map.Entry<?, ?> e : ((Dict<?, ?>) positional[0]).entrySet()) {
+              return e.getValue();
+            }
+            throw Starlark.errorf("select: empty dict");
+          }
+
+          @Override
+          public String getName() {
+            return "select";
+          }
+        });
+
     topLevelBootstrap.addBindingsToBuilder(envBuilder);
     androidBootstrap.addBindingsToBuilder(envBuilder);
     appleBootstrap.addBindingsToBuilder(envBuilder);
@@ -605,7 +637,7 @@ public class SkydocMain {
     testingBootstrap.addBindingsToBuilder(envBuilder);
     addNonBootstrapGlobals(envBuilder);
 
-    return GlobalFrame.createForBuiltins(envBuilder.build());
+    return Module.createForBuiltins(envBuilder.build());
   }
 
   // TODO(cparsons): Remove this constant by migrating the contained symbols to bootstraps.
@@ -628,6 +660,7 @@ public class SkydocMain {
     GeneratedExtensionRegistryProviderApi.NAME,
     AndroidBinaryDataInfoApi.NAME,
     JsModuleInfoApi.NAME,
+    "JsInfo",
     "PintoModuleProvider"
   };
 
@@ -644,14 +677,13 @@ public class SkydocMain {
 
   private static StarlarkThread createStarlarkThread(
       StarlarkSemantics semantics,
-      EventHandler eventHandler,
-      GlobalFrame globals,
+      Module globals,
       Map<String, Extension> imports) {
+    // We use the default print handler, which writes to stderr.
     return StarlarkThread.builder(Mutability.create("Skydoc"))
         .setSemantics(semantics)
         .setGlobals(globals)
         .setImportedExtensions(imports)
-        .setEventHandler(eventHandler)
         .build();
   }
 
@@ -660,6 +692,10 @@ public class SkydocMain {
   static class StarlarkEvaluationException extends Exception {
     public StarlarkEvaluationException(String message) {
       super(message);
+    }
+
+    public StarlarkEvaluationException(String message, Throwable cause) {
+      super(message, cause);
     }
   }
 }

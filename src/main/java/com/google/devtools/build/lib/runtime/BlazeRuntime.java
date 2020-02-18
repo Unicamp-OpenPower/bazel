@@ -31,14 +31,17 @@ import com.google.devtools.build.lib.analysis.BlazeVersionInfo;
 import com.google.devtools.build.lib.analysis.ConfiguredRuleClassProvider;
 import com.google.devtools.build.lib.analysis.ServerDirectories;
 import com.google.devtools.build.lib.analysis.config.BuildOptions;
-import com.google.devtools.build.lib.analysis.config.ConfigurationFragmentFactory;
 import com.google.devtools.build.lib.analysis.test.CoverageReportActionFactory;
 import com.google.devtools.build.lib.bugreport.BugReport;
 import com.google.devtools.build.lib.bugreport.BugReporter;
+import com.google.devtools.build.lib.buildeventstream.BuildEvent.LocalFile.LocalFileType;
+import com.google.devtools.build.lib.buildeventstream.BuildEventArtifactUploader;
+import com.google.devtools.build.lib.buildeventstream.BuildEventArtifactUploader.UploadContext;
+import com.google.devtools.build.lib.buildeventstream.BuildEventProtocolOptions;
+import com.google.devtools.build.lib.buildtool.buildevent.ProfilerStartedEvent;
 import com.google.devtools.build.lib.clock.BlazeClock;
 import com.google.devtools.build.lib.clock.Clock;
 import com.google.devtools.build.lib.events.Event;
-import com.google.devtools.build.lib.events.EventHandler;
 import com.google.devtools.build.lib.events.ExtendedEventHandler;
 import com.google.devtools.build.lib.events.OutputFilter;
 import com.google.devtools.build.lib.exec.BinTools;
@@ -145,7 +148,6 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
   private final Runnable abruptShutdownHandler;
 
   private final PackageFactory packageFactory;
-  private final ImmutableList<ConfigurationFragmentFactory> configurationFragmentFactories;
   private final ConfiguredRuleClassProvider ruleClassProvider;
   // For bazel info.
   private final ImmutableMap<String, InfoItem> infoItems;
@@ -169,6 +171,7 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
   private final ActionKeyContext actionKeyContext;
   private final ImmutableMap<String, AuthHeadersProvider> authHeadersProviderMap;
   private final RetainedHeapLimiter retainedHeapLimiter = new RetainedHeapLimiter();
+  @Nullable private final RepositoryRemoteExecutorFactory repositoryRemoteExecutorFactory;
 
   // Workspace state (currently exactly one workspace per server)
   private BlazeWorkspace workspace;
@@ -180,7 +183,6 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
       ImmutableList<OutputFormatter> queryOutputFormatters,
       PackageFactory pkgFactory,
       ConfiguredRuleClassProvider ruleClassProvider,
-      ImmutableList<ConfigurationFragmentFactory> configurationFragmentFactories,
       ImmutableMap<String, InfoItem> infoItems,
       ActionKeyContext actionKeyContext,
       Clock clock,
@@ -195,7 +197,8 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
       Iterable<BlazeCommand> commands,
       String productName,
       BuildEventArtifactUploaderFactoryMap buildEventArtifactUploaderFactoryMap,
-      ImmutableMap<String, AuthHeadersProvider> authHeadersProviderMap) {
+      ImmutableMap<String, AuthHeadersProvider> authHeadersProviderMap,
+      RepositoryRemoteExecutorFactory repositoryRemoteExecutorFactory) {
     // Server state
     this.fileSystem = fileSystem;
     this.blazeModules = blazeModules;
@@ -207,7 +210,6 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
     this.moduleInvocationPolicy = moduleInvocationPolicy;
 
     this.ruleClassProvider = ruleClassProvider;
-    this.configurationFragmentFactories = configurationFragmentFactories;
     this.infoItems = infoItems;
     this.actionKeyContext = actionKeyContext;
     this.clock = clock;
@@ -225,6 +227,7 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
     this.buildEventArtifactUploaderFactoryMap = buildEventArtifactUploaderFactoryMap;
     this.authHeadersProviderMap =
         Preconditions.checkNotNull(authHeadersProviderMap, "authHeadersProviderMap");
+    this.repositoryRemoteExecutorFactory = repositoryRemoteExecutorFactory;
   }
 
   public BlazeWorkspace initWorkspace(BlazeDirectories directories, BinTools binTools)
@@ -278,42 +281,63 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
     return moduleInvocationPolicy;
   }
 
+  private BuildEventArtifactUploader newUploader(
+      CommandEnvironment env, String buildEventUploadStrategy) {
+    return getBuildEventArtifactUploaderFactoryMap().select(buildEventUploadStrategy).create(env);
+  }
+
   /** Configure profiling based on the provided options. */
-  Path initProfiler(
-      EventHandler eventHandler,
+  ProfilerStartedEvent initProfiler(
+      ExtendedEventHandler eventHandler,
       BlazeWorkspace workspace,
       CommonCommandOptions options,
-      UUID buildID,
+      BuildEventProtocolOptions bepOptions,
+      CommandEnvironment env,
       long execStartTimeNanos,
       long waitTimeInMs) {
     OutputStream out = null;
     boolean recordFullProfilerData = options.recordFullProfilerData;
     ImmutableSet.Builder<ProfilerTask> profiledTasksBuilder = ImmutableSet.builder();
-    Profiler.Format format = Profiler.Format.BINARY_BAZEL_FORMAT;
+    Profiler.Format format = Format.JSON_TRACE_FILE_FORMAT;
     Path profilePath = null;
+    String profileName = null;
+    UploadContext streamingContext = null;
     try {
-      if (options.enableTracer || (options.removeBinaryProfile && options.profilePath != null)) {
-        format =
-            options.enableTracerCompression
-                ? Format.JSON_TRACE_FILE_COMPRESSED_FORMAT
-                : Profiler.Format.JSON_TRACE_FILE_FORMAT;
+      if (options.enableTracer || options.profilePath != null) {
+        if (options.enableTracerCompression == TriState.YES
+            || (options.enableTracerCompression == TriState.AUTO
+                && (options.profilePath == null
+                    || options.profilePath.toString().endsWith(".gz")))) {
+          format = Format.JSON_TRACE_FILE_COMPRESSED_FORMAT;
+        } else {
+          format = Profiler.Format.JSON_TRACE_FILE_FORMAT;
+        }
         if (options.profilePath != null) {
           profilePath = workspace.getWorkspace().getRelative(options.profilePath);
+          out = profilePath.getOutputStream();
         } else {
-          String profileName = "command.profile";
+          profileName = "command.profile";
           if (format == Format.JSON_TRACE_FILE_COMPRESSED_FORMAT) {
             profileName = "command.profile.gz";
           }
-          profilePath = workspace.getOutputBase().getRelative(profileName);
+          if (bepOptions.streamingLogFileUploads) {
+            BuildEventArtifactUploader buildEventArtifactUploader =
+                newUploader(env, bepOptions.buildEventUploadStrategy);
+            streamingContext = buildEventArtifactUploader.startUpload(LocalFileType.LOG, null);
+            out = streamingContext.getOutputStream();
+          } else {
+            profilePath = workspace.getOutputBase().getRelative(profileName);
+            out = profilePath.getOutputStream();
+          }
         }
-        out = profilePath.getOutputStream();
-        eventHandler.handle(Event.info("Writing tracer profile to '" + profilePath + "'"));
+        if (profilePath != null && options.announceProfilePath) {
+          eventHandler.handle(Event.info("Writing tracer profile to '" + profilePath + "'"));
+        }
         for (ProfilerTask profilerTask : ProfilerTask.values()) {
           if (!profilerTask.isVfs()
               // CRITICAL_PATH corresponds to writing the file.
               && profilerTask != ProfilerTask.CRITICAL_PATH
               && profilerTask != ProfilerTask.SKYFUNCTION
-              && profilerTask != ProfilerTask.ACTION_COMPLETE
               && !profilerTask.isStarlark()) {
             profiledTasksBuilder.add(profilerTask);
           }
@@ -321,14 +345,6 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
         profiledTasksBuilder.addAll(options.additionalProfileTasks);
         if (options.recordFullProfilerData) {
           profiledTasksBuilder.addAll(EnumSet.allOf(ProfilerTask.class));
-        }
-      } else if (options.profilePath != null) {
-        profilePath = workspace.getWorkspace().getRelative(options.profilePath);
-
-        out = profilePath.getOutputStream();
-        eventHandler.handle(Event.info("Writing profile data to '" + profilePath + "'"));
-        for (ProfilerTask profilerTask : ProfilerTask.values()) {
-          profiledTasksBuilder.add(profilerTask);
         }
       } else if (options.alwaysProfileSlowOperations) {
         recordFullProfilerData = false;
@@ -346,9 +362,8 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
             profiledTasks,
             out,
             format,
-            getProductName(),
             workspace.getOutputBase().toString(),
-            buildID,
+            env.getCommandId(),
             recordFullProfilerData,
             clock,
             execStartTimeNanos,
@@ -393,7 +408,7 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
     } catch (IOException e) {
       eventHandler.handle(Event.error("Error while creating profile file: " + e.getMessage()));
     }
-    return profilePath;
+    return new ProfilerStartedEvent(profileName, profilePath, streamingContext);
   }
 
   public FileSystem getFileSystem() {
@@ -488,10 +503,6 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
       }
     }
     return null;
-  }
-
-  public ImmutableList<ConfigurationFragmentFactory> getConfigurationFragmentFactories() {
-    return configurationFragmentFactories;
   }
 
   /**
@@ -644,15 +655,17 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
     }
     env.getBlazeWorkspace().clearEventBus();
 
+    for (BlazeModule module : blazeModules) {
+      try (SilentCloseable closeable = Profiler.instance().profile(module + ".commandComplete")) {
+        module.commandComplete();
+      }
+    }
+
     try {
       Profiler.instance().stop();
       MemoryProfiler.instance().stop();
     } catch (IOException e) {
       env.getReporter().handle(Event.error("Error while writing profile file: " + e.getMessage()));
-    }
-
-    for (BlazeModule module : blazeModules) {
-      module.commandComplete();
     }
 
     env.getReporter().clearEventBus();
@@ -781,10 +794,12 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
    * handler is registered.
    */
   public static final class RemoteExceptionHandler implements SubscriberExceptionHandler {
+    static final String FAILURE_MSG = "Failure in EventBus subscriber";
+
     @Override
     public void handleException(Throwable exception, SubscriberExceptionContext context) {
-      logger.log(Level.SEVERE, "Failure in EventBus subscriber", exception);
-      LoggingUtil.logToRemote(Level.SEVERE, "Failure in EventBus subscriber.", exception);
+      logger.log(Level.SEVERE, FAILURE_MSG, exception);
+      LoggingUtil.logToRemote(Level.SEVERE, FAILURE_MSG, exception);
     }
   }
 
@@ -873,19 +888,19 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
    */
   @VisibleForTesting
   static class CommandLineOptions {
-    private final List<String> startupArgs;
-    private final List<String> otherArgs;
+    private final ImmutableList<String> startupArgs;
+    private final ImmutableList<String> otherArgs;
 
-    CommandLineOptions(List<String> startupArgs, List<String> otherArgs) {
-      this.startupArgs = ImmutableList.copyOf(startupArgs);
-      this.otherArgs = ImmutableList.copyOf(otherArgs);
+    CommandLineOptions(ImmutableList<String> startupArgs, ImmutableList<String> otherArgs) {
+      this.startupArgs = Preconditions.checkNotNull(startupArgs);
+      this.otherArgs = Preconditions.checkNotNull(otherArgs);
     }
 
-    public List<String> getStartupArgs() {
+    public ImmutableList<String> getStartupArgs() {
       return startupArgs;
     }
 
-    public List<String> getOtherArgs() {
+    public ImmutableList<String> getOtherArgs() {
       return otherArgs;
     }
   }
@@ -932,7 +947,8 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
         }
       }
     }
-    return new CommandLineOptions(startupArgs, otherArgs);
+    return new CommandLineOptions(
+        ImmutableList.copyOf(startupArgs), ImmutableList.copyOf(otherArgs));
   }
 
   private static InterruptSignalHandler captureSigint() {
@@ -1311,10 +1327,6 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
     CustomExitCodePublisher.setAbruptExitStatusFileDir(
         serverDirectories.getOutputBase().getPathString());
 
-    // Most static initializers for @SkylarkSignature-containing classes have already run by this
-    // point, but this will pick up the stragglers.
-    initSkylarkBuiltinsRegistry();
-
     AutoProfiler.setClock(runtime.getClock());
     BugReport.setRuntime(runtime);
     BlazeDirectories directories =
@@ -1331,38 +1343,6 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
     // Keep this line last in this method, so that all other initialization is available to it.
     runtime.initWorkspace(directories, binTools);
     return runtime;
-  }
-
-  /**
-   * Configures the Skylark builtins registry.
-   *
-   * <p>Any class containing {@link SkylarkSignature}-annotated fields should call
-   * {@link SkylarkSignatureProcessor#configureSkylarkFunctions} on itself. This serves two
-   * purposes: 1) it initializes those fields for use, and 2) it registers them with the Skylark
-   * builtins registry object
-   * ({@link com.google.devtools.build.lib.syntax.Runtime#getBuiltinRegistry}). Unfortunately
-   * there's some technical debt here: The registry object is static and the registration occurs
-   * inside static initializer blocks.
-   *
-   * <p>The registry supports concurrent read/write access, but read access is not actually
-   * efficient (lockless) until write access is disallowed by calling its
-   * {@link com.google.devtools.build.lib.syntax.Runtime.BuiltinRegistry#freeze freeze} method.
-   * We want to freeze before the build begins, but not before all classes have had a chance to run
-   * their static initializers.
-   *
-   * <p>Therefore, this method first ensures that the initializers have run, and then explicitly
-   * freezes the registry. It ensures initialization by calling a no-op static method on the class.
-   * Only classes whose initializers have been observed to cause {@code BuiltinRegistry} to throw an
-   * exception need to be included here, since that indicates that their initialization did not
-   * happen by this point in time.
-   *
-   * <p>Unit tests don't need to worry about registry freeze exceptions, since the registry isn't
-   * frozen at all for them. They just pay the cost of extra synchronization on every access.
-   */
-  private static void initSkylarkBuiltinsRegistry() {
-    // Currently no classes need to be initialized here. The hook's still here because it's
-    // possible it may be needed again in the future.
-    com.google.devtools.build.lib.syntax.Runtime.getBuiltinRegistry().freeze();
   }
 
   private static String maybeGetPidString() {
@@ -1457,6 +1437,10 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
   /** Returns a map of all registered {@link AuthHeadersProvider}s. */
   public ImmutableMap<String, AuthHeadersProvider> getAuthHeadersProvidersMap() {
     return authHeadersProviderMap;
+  }
+
+  public RepositoryRemoteExecutorFactory getRepositoryRemoteExecutorFactory() {
+    return repositoryRemoteExecutorFactory;
   }
 
   /**
@@ -1583,7 +1567,6 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
           serverBuilder.getQueryOutputFormatters(),
           packageFactory,
           ruleClassProvider,
-          ruleClassProvider.getConfigurationFragments(),
           serverBuilder.getInfoItems(),
           actionKeyContext,
           clock,
@@ -1598,7 +1581,8 @@ public final class BlazeRuntime implements BugReport.BlazeRuntimeInterface {
           serverBuilder.getCommands(),
           productName,
           serverBuilder.getBuildEventArtifactUploaderMap(),
-          serverBuilder.getAuthHeadersProvidersMap());
+          serverBuilder.getAuthHeadersProvidersMap(),
+          serverBuilder.getRepositoryRemoteExecutorFactory());
     }
 
     public Builder setProductName(String productName) {

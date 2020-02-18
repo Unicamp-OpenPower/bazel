@@ -20,8 +20,11 @@ import static java.util.logging.Level.WARNING;
 
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.devtools.build.lib.actions.ActionExecutionMetadata;
 import com.google.devtools.build.lib.actions.ActionInput;
+import com.google.devtools.build.lib.actions.Artifact;
 import com.google.devtools.build.lib.actions.CommandLines.ParamFileActionInput;
 import com.google.devtools.build.lib.actions.ExecException;
 import com.google.devtools.build.lib.actions.ResourceManager;
@@ -35,6 +38,7 @@ import com.google.devtools.build.lib.concurrent.ThreadSafety.ThreadSafe;
 import com.google.devtools.build.lib.exec.BinTools;
 import com.google.devtools.build.lib.exec.RunfilesTreeUpdater;
 import com.google.devtools.build.lib.exec.SpawnRunner;
+import com.google.devtools.build.lib.exec.SpawnRunner.SpawnExecutionContext;
 import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.ProfilerTask;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
@@ -196,6 +200,12 @@ public class LocalSpawnRunner implements SpawnRunner {
     private State currentState = State.INITIALIZING;
     private final Map<State, Long> stateTimes = new EnumMap<>(State.class);
 
+    /**
+     * If true, the local subprocess has already started, which means we need to clean up the output
+     * tree once we get interrupted.
+     */
+    private boolean needCleanup = false;
+
     private final int id;
 
     public SubprocessHandler(Spawn spawn, SpawnExecutionContext context) {
@@ -209,6 +219,12 @@ public class LocalSpawnRunner implements SpawnRunner {
     public SpawnResult run() throws InterruptedException, IOException {
       try {
         return start();
+      } catch (InterruptedException e) {
+        maybeCleanupOnInterrupt();
+        // Logging the exception causes a lot of noise in builds using the dynamic scheduler, and
+        // the information is not very interesting, so avoid that.
+        stepLog(SEVERE, "Interrupted (and cleanup finished)");
+        throw e;
       } catch (Error e) {
         stepLog(SEVERE, e, UNHANDLED_EXCEPTION_MSG);
         throw e;
@@ -303,7 +319,7 @@ public class LocalSpawnRunner implements SpawnRunner {
         context.prefetchInputs();
       }
 
-      for (ActionInput input : spawn.getInputFiles()) {
+      for (ActionInput input : spawn.getInputFiles().toList()) {
         if (input instanceof ParamFileActionInput) {
           VirtualActionInput virtualActionInput = (VirtualActionInput) input;
           Path outputPath = execRoot.getRelative(virtualActionInput.getExecPath());
@@ -325,7 +341,7 @@ public class LocalSpawnRunner implements SpawnRunner {
       try {
         Path commandTmpDir = tmpDir.getRelative("work");
         commandTmpDir.createDirectory();
-        Map<String, String> environment =
+        ImmutableMap<String, String> environment =
             localEnvProvider.rewriteLocalEnv(
                 spawn.getEnvironment(), binTools, commandTmpDir.getPathString());
 
@@ -334,7 +350,7 @@ public class LocalSpawnRunner implements SpawnRunner {
         subprocessBuilder.setStdout(outErr.getOutputPath().getPathFile());
         subprocessBuilder.setStderr(outErr.getErrorPath().getPathFile());
         subprocessBuilder.setEnv(environment);
-        List<String> args;
+        ImmutableList<String> args;
         if (useProcessWrapper) {
           // If the process wrapper is enabled, we use its timeout feature, which first interrupts
           // the subprocess and only kills it after a grace period so that the subprocess can output
@@ -348,7 +364,7 @@ public class LocalSpawnRunner implements SpawnRunner {
             statisticsPath = tmpDir.getRelative("stats.out");
             commandLineBuilder.setStatisticsPath(statisticsPath);
           }
-          args = commandLineBuilder.build();
+          args = ImmutableList.copyOf(commandLineBuilder.build());
         } else {
           subprocessBuilder.setTimeoutMillis(context.getTimeout().toMillis());
           args = spawn.getArguments();
@@ -357,8 +373,9 @@ public class LocalSpawnRunner implements SpawnRunner {
         // Command does. We sometimes get relative paths here, so we need to handle it.
         File argv0 = new File(args.get(0));
         if (!argv0.isAbsolute() && argv0.getParent() != null) {
-          args = new ArrayList<>(args);
-          args.set(0, new File(execRoot.getPathFile(), args.get(0)).getAbsolutePath());
+          List<String> newArgs = new ArrayList<>(args);
+          newArgs.set(0, new File(execRoot.getPathFile(), newArgs.get(0)).getAbsolutePath());
+          args = ImmutableList.copyOf(newArgs);
         }
         subprocessBuilder.setArgv(args);
 
@@ -367,6 +384,7 @@ public class LocalSpawnRunner implements SpawnRunner {
         try (SilentCloseable c =
             Profiler.instance()
                 .profile(ProfilerTask.PROCESS_TIME, spawn.getResourceOwner().getMnemonic())) {
+          needCleanup = true;
           Subprocess subprocess = subprocessBuilder.start();
           subprocess.getOutputStream().close();
           try {
@@ -444,6 +462,43 @@ public class LocalSpawnRunner implements SpawnRunner {
 
     private boolean wasTimeout(Duration timeout, Duration wallTime) {
       return !timeout.isZero() && wallTime.compareTo(timeout) > 0;
+    }
+
+    /**
+     * Clean up any known side-effects that the running spawn may have had on the output tree.
+     *
+     * <p>This is supposed to leave the output tree as it was right after {@link
+     * com.google.devtools.build.lib.skyframe.SkyframeActionExecutor} created the output directories
+     * for the spawn, which means that any outputs have to be deleted but any top-level directory
+     * for tree artifacts has to be kept behind (and empty).
+     */
+    private void maybeCleanupOnInterrupt() {
+      if (!localExecutionOptions.localLockfreeOutput) {
+        // If we don't allow lockfree executions of local subprocesses, there is no need to clean up
+        // anything: we would have already locked the output tree upfront, so we "own" it.
+        return;
+      }
+      if (!needCleanup) {
+        // If the subprocess has not yet started, there is no need to worry about checking on-disk
+        // state.
+        return;
+      }
+
+      for (ActionInput output : spawn.getOutputFiles()) {
+        Path path = context.getPathResolver().toPath(output);
+        try {
+          if (path.exists()) {
+            stepLog(INFO, "Clearing output %s after interrupt", path);
+            if (output instanceof Artifact && ((Artifact) output).isTreeArtifact()) {
+              path.deleteTreesBelow();
+            } else {
+              path.deleteTree();
+            }
+          }
+        } catch (IOException e) {
+          stepLog(SEVERE, e, "Cannot delete local output %s after interrupt", path);
+        }
+      }
     }
   }
 

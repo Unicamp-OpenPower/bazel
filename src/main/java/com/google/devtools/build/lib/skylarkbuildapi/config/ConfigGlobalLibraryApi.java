@@ -14,18 +14,15 @@
 
 package com.google.devtools.build.lib.skylarkbuildapi.config;
 
-import com.google.devtools.build.lib.events.Location;
 import com.google.devtools.build.lib.skylarkinterface.Param;
 import com.google.devtools.build.lib.skylarkinterface.SkylarkCallable;
 import com.google.devtools.build.lib.skylarkinterface.SkylarkConstructor;
 import com.google.devtools.build.lib.skylarkinterface.SkylarkGlobalLibrary;
 import com.google.devtools.build.lib.syntax.BaseFunction;
+import com.google.devtools.build.lib.syntax.Dict;
 import com.google.devtools.build.lib.syntax.EvalException;
-import com.google.devtools.build.lib.syntax.SkylarkDict;
-import com.google.devtools.build.lib.syntax.SkylarkList;
-import com.google.devtools.build.lib.syntax.StarlarkSemantics;
+import com.google.devtools.build.lib.syntax.Sequence;
 import com.google.devtools.build.lib.syntax.StarlarkThread;
-import java.util.List;
 
 /**
  * A collection of top-level Starlark functions pertaining to configuration.
@@ -81,7 +78,7 @@ public interface ConfigGlobalLibraryApi {
                     + "split transition."),
         @Param(
             name = "inputs",
-            type = SkylarkList.class,
+            type = Sequence.class,
             generic1 = String.class,
             positional = false,
             named = true,
@@ -91,7 +88,7 @@ public interface ConfigGlobalLibraryApi {
                     + "parameter."),
         @Param(
             name = "outputs",
-            type = SkylarkList.class,
+            type = Sequence.class,
             generic1 = String.class,
             positional = false,
             named = true,
@@ -99,30 +96,29 @@ public interface ConfigGlobalLibraryApi {
                 "List of build settings that can be written by this transition. This must be "
                     + "a superset of the key set of the dictionary returned by this transition."),
       },
-      useLocation = true,
       useStarlarkThread = true)
   @SkylarkConstructor(objectType = ConfigurationTransitionApi.class)
   ConfigurationTransitionApi transition(
       BaseFunction implementation,
-      List<String> inputs,
-      List<String> outputs,
-      Location location,
+      Sequence<?> inputs, // <String> expected
+      Sequence<?> outputs, // <String> expected
       StarlarkThread thread)
       throws EvalException;
 
   @SkylarkCallable(
       name = "analysis_test_transition",
-      // TODO(cparsons): Improve documentation with an example once this feature is
-      // non-experimental.
       doc =
-          "<b>Experimental. This type is experimental and subject to change at any time. Do "
-              + "not depend on it.</b><p> Creates a configuration transition to be applied on "
+          "<p> Creates a configuration transition to be applied on "
               + "an analysis-test rule's dependencies. This transition may only be applied "
-              + "on attributes of rules with <code>analysis_test = True</code>.",
+              + "on attributes of rules with <code>analysis_test = True</code>. Such rules are "
+              + "restricted in capabilities (for example, the size of their dependency tree is "
+              + "limited), so transitions created using this function are limited in potential "
+              + "scope as compared to transitions created using "
+              + "<a href=\"#transition\">transition</a>.",
       parameters = {
         @Param(
             name = "settings",
-            type = SkylarkDict.class,
+            type = Dict.class,
             positional = false,
             named = true,
             doc =
@@ -132,9 +128,9 @@ public interface ConfigGlobalLibraryApi {
                     + "are unchanged. Use this to declare specific configuration settings that "
                     + "an analysis test requires to be set in order to pass."),
       },
-      useLocation = true,
-      useStarlarkSemantics = true)
-  public ConfigurationTransitionApi analysisTestTransition(
-      SkylarkDict<String, String> changedSettings, Location location, StarlarkSemantics semantics)
+      useStarlarkThread = true)
+  ConfigurationTransitionApi analysisTestTransition(
+      Dict<?, ?> changedSettings, // <String, String> expected
+      StarlarkThread thread)
       throws EvalException;
 }

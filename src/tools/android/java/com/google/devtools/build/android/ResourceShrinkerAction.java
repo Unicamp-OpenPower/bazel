@@ -68,6 +68,7 @@ import org.xml.sax.SAXException;
  *       --shrunkResources path to write shrunk resources zip
  * </pre>
  */
+@Deprecated
 public class ResourceShrinkerAction {
   private static final StdLogger stdLogger = new StdLogger(StdLogger.Level.WARNING);
   private static final Logger logger = Logger.getLogger(ResourceShrinkerAction.class.getName());
@@ -195,20 +196,6 @@ public class ResourceShrinkerAction {
       help = "Path to where the shrinker log should be written."
     )
     public Path log;
-
-    /**
-     * @deprecated pending an upcoming AAPT2 drop, we will always write to resourcesConfigOutput and
-     *     stop writing to this output.
-     */
-    @Deprecated // TODO(b/141204955): remove
-    @Option(
-        name = "keptResourcesOutput",
-        defaultValue = "null",
-        converter = PathConverter.class,
-        documentationCategory = OptionDocumentationCategory.UNDOCUMENTED,
-        effectTags = {OptionEffectTag.UNKNOWN},
-        help = "Path to where the list of kept resources should be written.")
-    public Path keptResourcesOutput;
 
     @Option(
         name = "resourcesConfigOutput",

@@ -60,7 +60,6 @@ import com.google.devtools.build.lib.runtime.CountingArtifactGroupNamer;
 import com.google.devtools.build.lib.runtime.SynchronizedOutputStream;
 import com.google.devtools.build.lib.util.AbruptExitException;
 import com.google.devtools.build.lib.util.ExitCode;
-import com.google.devtools.build.lib.util.LoggingUtil;
 import com.google.devtools.build.lib.util.io.OutErr;
 import com.google.devtools.common.options.OptionsBase;
 import com.google.devtools.common.options.OptionsParsingException;
@@ -79,7 +78,6 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
 
@@ -193,7 +191,7 @@ public abstract class BuildEventServiceModule<BESOptionsT extends BuildEventServ
     return e.getCause() instanceof TimeoutException;
   }
 
-  private void waitForPreviousInvocation() {
+  private void waitForPreviousInvocation(boolean isShutdown) {
     if (closeFuturesWithTimeoutsMap.isEmpty()) {
       return;
     }
@@ -214,7 +212,8 @@ public abstract class BuildEventServiceModule<BESOptionsT extends BuildEventServ
     boolean cancelCloseFutures = true;
     switch (previousUploadMode) {
       case FULLY_ASYNC:
-        waitingFutureMap = halfCloseFuturesWithTimeoutsMap;
+        waitingFutureMap =
+            isShutdown ? closeFuturesWithTimeoutsMap : halfCloseFuturesWithTimeoutsMap;
         cancelCloseFutures = false;
         break;
       case WAIT_FOR_UPLOAD_COMPLETE:
@@ -328,7 +327,7 @@ public abstract class BuildEventServiceModule<BESOptionsT extends BuildEventServ
     // allow completing previous runs using BES, for example:
     //   bazel build (..run with async BES..)
     //   bazel info <-- Doesn't run with BES unless we wait before checking the whitelist.
-    waitForPreviousInvocation();
+    waitForPreviousInvocation("shutdown".equals(cmdEnv.getCommandName()));
 
     if (!whitelistedCommands(besOptions).contains(cmdEnv.getCommandName())) {
       // Exit early if the running command isn't supported.
@@ -394,7 +393,6 @@ public abstract class BuildEventServiceModule<BESOptionsT extends BuildEventServ
       Uninterruptibles.getUninterruptibly(Futures.allAsList(closeFuturesWithTimeoutsMap.values()));
     } catch (ExecutionException e) {
       googleLogger.atSevere().withCause(e).log("Failed to close a build event transport");
-      LoggingUtil.logToRemote(Level.SEVERE, "Failed to close a build event transport", e);
     } finally {
       cancelAndResetPendingUploads();
     }
@@ -547,9 +545,7 @@ public abstract class BuildEventServiceModule<BESOptionsT extends BuildEventServ
         // This should not occur, but close with an internal error if a {@link BuildEventStreamer}
         // bug manifests as an unclosed streamer.
         googleLogger.atWarning().log("Attempting to close BES streamer after command");
-        String msg = "BES was not properly closed";
-        LoggingUtil.logToRemote(Level.WARNING, msg, new IllegalStateException(msg));
-        reporter.handle(Event.warn(msg));
+        reporter.handle(Event.warn("BES was not properly closed"));
         forceShutdownBuildEventStreamer();
       }
 

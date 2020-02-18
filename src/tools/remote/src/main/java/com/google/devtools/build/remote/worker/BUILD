@@ -11,7 +11,6 @@ filegroup(
 java_library(
     name = "worker",
     srcs = glob(["*.java"]),
-    data = ["//src:libunix"],
     resources = ["//src/main/tools:linux-sandbox"],
     visibility = ["//src/tools/remote:__subpackages__"],
     deps = [
@@ -26,7 +25,6 @@ java_library(
         "//src/main/java/com/google/devtools/build/lib/actions",
         "//src/main/java/com/google/devtools/build/lib/actions:localhost_capacity",
         "//src/main/java/com/google/devtools/build/lib/remote",
-        "//src/main/java/com/google/devtools/build/lib/remote/blobstore",
         "//src/main/java/com/google/devtools/build/lib/remote/common",
         "//src/main/java/com/google/devtools/build/lib/remote/disk",
         "//src/main/java/com/google/devtools/build/lib/remote/options",

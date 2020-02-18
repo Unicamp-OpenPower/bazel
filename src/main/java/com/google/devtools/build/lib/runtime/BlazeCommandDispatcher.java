@@ -27,6 +27,7 @@ import com.google.common.util.concurrent.UncheckedExecutionException;
 import com.google.devtools.build.lib.analysis.NoBuildEvent;
 import com.google.devtools.build.lib.bugreport.BugReport;
 import com.google.devtools.build.lib.bugreport.BugReporter;
+import com.google.devtools.build.lib.buildeventstream.BuildEventProtocolOptions;
 import com.google.devtools.build.lib.buildtool.buildevent.ProfilerStartedEvent;
 import com.google.devtools.build.lib.clock.BlazeClock;
 import com.google.devtools.build.lib.events.Event;
@@ -39,6 +40,7 @@ import com.google.devtools.build.lib.events.StoredEventHandler;
 import com.google.devtools.build.lib.profiler.Profiler;
 import com.google.devtools.build.lib.profiler.SilentCloseable;
 import com.google.devtools.build.lib.runtime.proto.InvocationPolicyOuterClass.InvocationPolicy;
+import com.google.devtools.build.lib.syntax.Starlark;
 import com.google.devtools.build.lib.util.AbruptExitException;
 import com.google.devtools.build.lib.util.AnsiStrippingOutputStream;
 import com.google.devtools.build.lib.util.ExitCode;
@@ -52,8 +54,10 @@ import com.google.devtools.common.options.OpaqueOptionsData;
 import com.google.devtools.common.options.OptionsParser;
 import com.google.devtools.common.options.OptionsParsingResult;
 import java.io.BufferedOutputStream;
+import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
@@ -286,11 +290,15 @@ public class BlazeCommandDispatcher implements CommandDispatcher {
     // We cannot flip an incompatible flag that expands to other flags, so we do it manually here.
     // If an option is specified explicitly, we give that preference.
     boolean commandSupportsProfile =
-        (commandAnnotation.builds() || "query".equals(commandName)) && !"clean".equals(commandName);
+        (commandAnnotation.builds() || "query".equals(commandName))
+            && !"clean".equals(commandName)
+            && !"info".equals(commandName);
+    boolean profileExplicitlyDisabled =
+        options.containsExplicitOption("experimental_generate_json_trace_profile")
+            && !commonOptions.enableTracer;
     if (commandSupportsProfile
         && commonOptions.enableProfileByDefault
-        && (!options.containsExplicitOption("experimental_generate_json_trace_profile")
-            || commonOptions.enableTracer)) {
+        && !profileExplicitlyDisabled) {
       commonOptions.enableTracer = true;
       if (!options.containsExplicitOption("experimental_slim_json_profile")) {
         commonOptions.enableJsonProfileDiet = true;
@@ -301,9 +309,6 @@ public class BlazeCommandDispatcher implements CommandDispatcher {
       if (!options.containsExplicitOption("experimental_profile_action_counts")) {
         commonOptions.enableActionCountProfile = true;
       }
-      if (!options.containsExplicitOption("experimental_json_trace_compression")) {
-        commonOptions.enableTracerCompression = true;
-      }
       if (!options.containsExplicitOption("experimental_post_profile_started_event")) {
         commonOptions.postProfileStartedEvent = true;
       }
@@ -311,16 +316,34 @@ public class BlazeCommandDispatcher implements CommandDispatcher {
     // TODO(ulfjack): Move the profiler initialization as early in the startup sequence as possible.
     // Profiler setup and shutdown must always happen in pairs. Shutdown is currently performed in
     // the afterCommand call in the finally block below.
-    Path profilePath =
+    ProfilerStartedEvent profilerStartedEvent =
         runtime.initProfiler(
             storedEventHandler,
             workspace,
             commonOptions,
-            env.getCommandId(),
+            options.getOptions(BuildEventProtocolOptions.class),
+            env,
             execStartTimeNanos,
             waitTimeInMs);
     if (commonOptions.postProfileStartedEvent) {
-      storedEventHandler.post(new ProfilerStartedEvent(profilePath));
+      storedEventHandler.post(profilerStartedEvent);
+    }
+
+    // Enable Starlark CPU profiling (--starlark_cpu_profile=/tmp/foo.pprof.gz)
+    if (!commonOptions.starlarkCpuProfile.isEmpty()) {
+      FileOutputStream out;
+      try {
+        out = new FileOutputStream(commonOptions.starlarkCpuProfile);
+      } catch (IOException ex) {
+        storedEventHandler.handle(Event.error("Starlark CPU profiler: " + ex.getMessage()));
+        return BlazeCommandResult.exitCode(ExitCode.LOCAL_ENVIRONMENTAL_ERROR);
+      }
+      try {
+        Starlark.startCpuProfile(out, Duration.ofMillis(10));
+      } catch (IllegalStateException ex) { // e.g. SIGPROF in use
+        storedEventHandler.handle(Event.error(ex.getMessage()));
+        return BlazeCommandResult.exitCode(ExitCode.LOCAL_ENVIRONMENTAL_ERROR);
+      }
     }
 
     BlazeCommandResult result = BlazeCommandResult.exitCode(ExitCode.BLAZE_INTERNAL_ERROR);
@@ -352,14 +375,15 @@ public class BlazeCommandDispatcher implements CommandDispatcher {
       // Early exit. We need to guarantee that the ErrOut and Reporter setup below never error out,
       // so any invariants they need must be checked before this point.
       if (!earlyExitCode.equals(ExitCode.SUCCESS)) {
-        return replayEarlyExitEvents(
+        replayEarlyExitEvents(
             outErr,
             optionHandler,
             storedEventHandler,
             env,
-            earlyExitCode,
             new NoBuildEvent(
                 commandName, firstContactTime, false, true, env.getCommandId().toString()));
+        result = BlazeCommandResult.exitCode(earlyExitCode);
+        return result;
       }
 
       try (SilentCloseable closeable = Profiler.instance().profile("setup event handler")) {
@@ -473,7 +497,8 @@ public class BlazeCommandDispatcher implements CommandDispatcher {
         env.beforeCommand(waitTimeInMs, invocationPolicy);
       } catch (AbruptExitException e) {
         reporter.handle(Event.error(e.getMessage()));
-        return BlazeCommandResult.exitCode(e.getExitCode());
+        result = BlazeCommandResult.exitCode(e.getExitCode());
+        return result;
       }
 
       // Log the command line now that the modules have all had a change to register their listeners
@@ -508,36 +533,52 @@ public class BlazeCommandDispatcher implements CommandDispatcher {
           earlyExitCode = e.getExitCode();
         }
         if (!earlyExitCode.equals(ExitCode.SUCCESS)) {
-          return replayEarlyExitEvents(
+          replayEarlyExitEvents(
               outErr,
               optionHandler,
               storedEventHandler,
               env,
-              earlyExitCode,
               new NoBuildEvent(
                   commandName, firstContactTime, false, true, env.getCommandId().toString()));
+          result = BlazeCommandResult.exitCode(earlyExitCode);
+          return result;
         }
       }
 
       // Parse starlark options.
       earlyExitCode = optionHandler.parseStarlarkOptions(env, storedEventHandler);
       if (!earlyExitCode.equals(ExitCode.SUCCESS)) {
-        return replayEarlyExitEvents(
+        replayEarlyExitEvents(
             outErr,
             optionHandler,
             storedEventHandler,
             env,
-            earlyExitCode,
             new NoBuildEvent(
                 commandName, firstContactTime, false, true, env.getCommandId().toString()));
+        result = BlazeCommandResult.exitCode(earlyExitCode);
+        return result;
       }
       options = optionHandler.getOptionsResult();
 
+      // Run the command.
       result = command.exec(env, options);
+
       ExitCode moduleExitCode = env.precompleteCommand(result.getExitCode());
       // If Blaze did not suffer an infrastructure failure, check for errors in modules.
       if (!result.getExitCode().isInfrastructureFailure() && moduleExitCode != null) {
         result = BlazeCommandResult.exitCode(moduleExitCode);
+      }
+
+      // Finalize the Starlark CPU profile.
+      if (!commonOptions.starlarkCpuProfile.isEmpty()) {
+        try {
+          Starlark.stopCpuProfile();
+        } catch (IOException ex) {
+          reporter.handle(Event.error("Starlark CPU profiler: " + ex.getMessage()));
+          if (result.getExitCode().equals(ExitCode.SUCCESS)) { // don't clobber existing error
+            result = BlazeCommandResult.exitCode(ExitCode.LOCAL_ENVIRONMENTAL_ERROR);
+          }
+        }
       }
 
       afterCommandCalled = true;
@@ -564,12 +605,11 @@ public class BlazeCommandDispatcher implements CommandDispatcher {
     }
   }
 
-  private static BlazeCommandResult replayEarlyExitEvents(
+  private static void replayEarlyExitEvents(
       OutErr outErr,
       BlazeOptionHandler optionHandler,
       StoredEventHandler storedEventHandler,
       CommandEnvironment env,
-      ExitCode earlyExitCode,
       NoBuildEvent noBuildEvent) {
     PrintingEventHandler printingEventHandler =
         new PrintingEventHandler(outErr, EventKind.ALL_EVENTS);
@@ -583,7 +623,6 @@ public class BlazeCommandDispatcher implements CommandDispatcher {
       env.getEventBus().post(post);
     }
     env.getEventBus().post(noBuildEvent);
-    return BlazeCommandResult.exitCode(earlyExitCode);
   }
 
   private OutErr bufferOut(OutErr outErr) {
@@ -649,6 +688,7 @@ public class BlazeCommandDispatcher implements CommandDispatcher {
         OptionsParser.builder()
             .optionsData(optionsData)
             .skippedPrefix("--//")
+            .skippedPrefix("--@")
             .allowResidue(annotation.allowResidue())
             .build();
     return parser;

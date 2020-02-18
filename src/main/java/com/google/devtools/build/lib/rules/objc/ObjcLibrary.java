@@ -22,6 +22,7 @@ import com.google.devtools.build.lib.analysis.ConfiguredTarget;
 import com.google.devtools.build.lib.analysis.RuleConfiguredTargetFactory;
 import com.google.devtools.build.lib.analysis.RuleContext;
 import com.google.devtools.build.lib.analysis.configuredtargets.RuleConfiguredTarget.Mode;
+import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.collect.nestedset.NestedSet;
 import com.google.devtools.build.lib.collect.nestedset.NestedSetBuilder;
 import com.google.devtools.build.lib.packages.SymbolGenerator;
@@ -48,7 +49,6 @@ public class ObjcLibrary implements RuleConfiguredTargetFactory {
     return new ObjcCommon.Builder(ruleContext)
         .setCompilationAttributes(
             CompilationAttributes.Builder.fromRuleContext(ruleContext).build())
-        .addDefines(ruleContext.getExpander().withDataLocations().tokenized("defines"))
         .setCompilationArtifacts(CompilationSupport.compilationArtifacts(ruleContext))
         .addDeps(ruleContext.getPrerequisiteConfiguredTargetAndTargets("deps", Mode.TARGET))
         .addRuntimeDeps(ruleContext.getPrerequisites("runtime_deps", Mode.TARGET))
@@ -90,6 +90,7 @@ public class ObjcLibrary implements RuleConfiguredTargetFactory {
     J2ObjcEntryClassProvider j2ObjcEntryClassProvider = new J2ObjcEntryClassProvider.Builder()
       .addTransitive(ruleContext.getPrerequisites("deps", Mode.TARGET,
           J2ObjcEntryClassProvider.class)).build();
+    ObjcProvider objcProvider = common.getObjcProvider();
     CcCompilationContext ccCompilationContext =
         CcCompilationContext.builder(
                 ruleContext, ruleContext.getConfiguration(), ruleContext.getLabel())
@@ -97,12 +98,16 @@ public class ObjcLibrary implements RuleConfiguredTargetFactory {
                 CompilationAttributes.Builder.fromRuleContext(ruleContext).build().hdrs().toList())
             .addTextualHdrs(common.getTextualHdrs())
             .addDeclaredIncludeSrcs(common.getTextualHdrs())
+            .setPurpose(
+                compilationSupport
+                    .createObjcCppSemantics(
+                        objcProvider, /* privateHdrs= */ ImmutableList.of(), /* pchHdr= */ null)
+                    .getPurpose())
             .build();
 
     CcLinkingContext ccLinkingContext =
-        buildCcLinkingContext(common, ruleContext.getSymbolGenerator());
+        buildCcLinkingContext(ruleContext.getLabel(), common, ruleContext.getSymbolGenerator());
 
-    ObjcProvider objcProvider = common.getObjcProvider();
     return ObjcRuleClasses.ruleConfiguredTarget(ruleContext, filesToBuild.build())
         .addNativeDeclaredProvider(objcProvider)
         .addSkylarkTransitiveInfo(ObjcProvider.SKYLARK_NAME, objcProvider)
@@ -120,10 +125,10 @@ public class ObjcLibrary implements RuleConfiguredTargetFactory {
   }
 
   private CcLinkingContext buildCcLinkingContext(
-      ObjcCommon common, SymbolGenerator<?> symbolGenerator) {
+      Label label, ObjcCommon common, SymbolGenerator<?> symbolGenerator) {
     ImmutableSet.Builder<LibraryToLink> libraries = new ImmutableSet.Builder<>();
     ObjcProvider objcProvider = common.getObjcProvider();
-    for (Artifact library : objcProvider.get(ObjcProvider.LIBRARY)) {
+    for (Artifact library : objcProvider.get(ObjcProvider.LIBRARY).toList()) {
       libraries.add(
           LibraryToLink.builder()
               .setStaticLibrary(library)
@@ -132,15 +137,16 @@ public class ObjcLibrary implements RuleConfiguredTargetFactory {
               .build());
     }
 
-    libraries.addAll(convertLibrariesToStaticLibraries(objcProvider.get(ObjcProvider.CC_LIBRARY)));
+    libraries.addAll(
+        convertLibrariesToStaticLibraries(objcProvider.get(ObjcProvider.CC_LIBRARY).toList()));
 
     CcLinkingContext.Builder ccLinkingContext =
         CcLinkingContext.builder()
-            .addLibraries(
-                NestedSetBuilder.<LibraryToLink>linkOrder().addAll(libraries.build()).build());
+            .setOwner(label)
+            .addLibraries(ImmutableList.copyOf(libraries.build()));
 
-    NestedSetBuilder<LinkOptions> userLinkFlags = NestedSetBuilder.linkOrder();
-    for (SdkFramework sdkFramework : objcProvider.get(ObjcProvider.SDK_FRAMEWORK)) {
+    ImmutableList.Builder<LinkOptions> userLinkFlags = ImmutableList.builder();
+    for (SdkFramework sdkFramework : objcProvider.get(ObjcProvider.SDK_FRAMEWORK).toList()) {
       userLinkFlags.add(
           LinkOptions.of(ImmutableList.of("-framework", sdkFramework.getName()), symbolGenerator));
     }

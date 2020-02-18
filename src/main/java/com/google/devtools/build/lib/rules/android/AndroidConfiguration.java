@@ -13,7 +13,6 @@
 // limitations under the License.
 package com.google.devtools.build.lib.rules.android;
 
-import static com.google.devtools.build.lib.packages.Type.STRING;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableSet;
@@ -30,8 +29,6 @@ import com.google.devtools.build.lib.analysis.config.InvalidConfigurationExcepti
 import com.google.devtools.build.lib.analysis.skylark.annotations.SkylarkConfigurationField;
 import com.google.devtools.build.lib.cmdline.Label;
 import com.google.devtools.build.lib.concurrent.ThreadSafety.Immutable;
-import com.google.devtools.build.lib.packages.RuleClass.ConfiguredTargetFactory.RuleErrorException;
-import com.google.devtools.build.lib.packages.RuleErrorConsumer;
 import com.google.devtools.build.lib.rules.cpp.CppConfiguration.DynamicMode;
 import com.google.devtools.build.lib.rules.cpp.CppOptions.DynamicModeConverter;
 import com.google.devtools.build.lib.rules.cpp.CppOptions.LibcTopLabelConverter;
@@ -84,6 +81,7 @@ public class AndroidConfiguration extends BuildConfiguration.Fragment
     }
   }
 
+  // TODO(b/142520065): Remove.
   /** Converter for {@link AndroidAaptVersion} */
   public static final class AndroidAaptConverter extends EnumConverter<AndroidAaptVersion> {
     public AndroidAaptConverter() {
@@ -185,88 +183,9 @@ public class AndroidConfiguration extends BuildConfiguration.Fragment
   }
 
   /** Types of android manifest mergers. */
+  @Deprecated
   public enum AndroidAaptVersion {
-    AAPT,
-    AAPT2,
-    AUTO;
-
-    public static List<String> getAttributeValues() {
-      return ImmutableList.of(
-          AAPT.name().toLowerCase(), AAPT2.name().toLowerCase(), getRuleAttributeDefault());
-    }
-
-    public static String getRuleAttributeDefault() {
-      return AUTO.name().toLowerCase();
-    }
-
-    public static AndroidAaptVersion fromString(String value) {
-      for (AndroidAaptVersion version : AndroidAaptVersion.values()) {
-        if (version.name().equalsIgnoreCase(value)) {
-          return version;
-        }
-      }
-      return null;
-    }
-
-    // TODO(corysmith): Move to an appropriate place when no longer needed as a public function.
-    @Nullable
-    public static AndroidAaptVersion chooseTargetAaptVersion(RuleContext ruleContext)
-        throws RuleErrorException {
-      if (ruleContext.isLegalFragment(AndroidConfiguration.class)) {
-
-        if (ruleContext.getRule().isAttrDefined("aapt_version", STRING)) {
-          // On rules that can choose a version, verify attribute and flag.
-          return chooseTargetAaptVersion(
-              AndroidDataContext.makeContext(ruleContext),
-              ruleContext,
-              ruleContext.attributes().get("aapt_version", STRING));
-        } else {
-          // On rules that can't choose, assume aapt2 if aapt2 is present in the sdk.
-          // This ensures that non-leaf nodes (e.g. android_library) will generate aapt2 actions.
-          return AndroidSdkProvider.fromRuleContext(ruleContext).getAapt2() != null ? AAPT2 : AAPT;
-        }
-      }
-      return null;
-    }
-
-    /**
-     * Select the aapt version for resource processing actions.
-     *
-     * <p>Order of precedence:
-     * <li>1. --android_aapt flag
-     * <li>2. 'aapt_version' attribute on target
-     *
-     * @param dataContext the Android data context for detecting aapt2 and fetching Android configs
-     * @param errorConsumer the rule context for reporting errors during version selection
-     * @param attributeString if not null, the aapt version specified by the 'aapt_version' target
-     *     attribute
-     * @return the selected version: aapt or aapt2
-     * @throws RuleErrorException error if aapt2 is requested but it's not available in the SDK
-     */
-    @Nullable
-    public static AndroidAaptVersion chooseTargetAaptVersion(
-        AndroidDataContext dataContext,
-        RuleErrorConsumer errorConsumer,
-        @Nullable String attributeString)
-        throws RuleErrorException {
-
-      boolean hasAapt2 = dataContext.getSdk().getAapt2() != null;
-      AndroidAaptVersion flag = dataContext.getAndroidConfig().getAndroidAaptVersion();
-      AndroidAaptVersion attribute = AndroidAaptVersion.fromString(attributeString);
-
-      AndroidAaptVersion version = flag == AUTO ? attribute : flag;
-
-      if (version == AAPT2 && !hasAapt2) {
-        throw errorConsumer.throwWithRuleError(
-            "aapt2 processing requested but not available on the android_sdk");
-      }
-
-      if (version == AUTO) {
-        return AAPT;
-      }
-
-      return version;
-    }
+    AAPT2;
   }
 
   /** Android configuration options. */
@@ -697,6 +616,7 @@ public class AndroidConfiguration extends BuildConfiguration.Fragment
                 + "before the manifests of its dependencies.")
     public ManifestMergerOrder manifestMergerOrder;
 
+    // TODO(b/142520065): Remove.
     @Option(
         name = "android_aapt",
         defaultValue = "aapt2",
@@ -906,8 +826,9 @@ public class AndroidConfiguration extends BuildConfiguration.Fragment
         help = "Tracking flag for when busybox workers are enabled.")
     public boolean persistentBusyboxTools;
 
+    // TODO(b/142520065): Remove.
     @Option(
-        name = "incompatible_use_aapt2_by_default",
+        name = "incompatible_prohibit_aapt1",
         documentationCategory = OptionDocumentationCategory.TOOLCHAIN,
         effectTags = {OptionEffectTag.LOSES_INCREMENTAL_STATE, OptionEffectTag.AFFECTS_OUTPUTS},
         metadataTags = {
@@ -916,10 +837,10 @@ public class AndroidConfiguration extends BuildConfiguration.Fragment
         },
         defaultValue = "true",
         help =
-            "Switch the Android rules to use aapt2 by default for resource processing. "
+            "End support for aapt in Android rules. "
                 + "To resolve issues when migrating your app to build with aapt2, see "
                 + "https://developer.android.com/studio/command-line/aapt2#aapt2_changes")
-    public boolean incompatibleUseAapt2ByDefault;
+    public boolean incompatibleProhibitAapt1;
 
     @Option(
         name = "experimental_remove_r_classes_from_instrumentation_test_jar",
@@ -963,6 +884,19 @@ public class AndroidConfiguration extends BuildConfiguration.Fragment
         help = "Use R.txt from the merging action, instead of from the validation action.")
     public boolean useRTxtFromMergedResources;
 
+    @Option(
+        name = "legacy_main_dex_list_generator",
+        // TODO(b/147692286): Update this default value to R8's GenerateMainDexList binary after
+        // migrating usage.
+        defaultValue = "null",
+        converter = LabelConverter.class,
+        documentationCategory = OptionDocumentationCategory.UNCATEGORIZED,
+        effectTags = {OptionEffectTag.UNKNOWN},
+        help =
+            "Specifies a binary to use to generate the list of classes that must be in the main"
+                + " dex when compiling legacy multidex.")
+    public Label legacyMainDexListGenerator;
+
     @Override
     public FragmentOptions getHost() {
       Options host = (Options) super.getHost();
@@ -990,6 +924,8 @@ public class AndroidConfiguration extends BuildConfiguration.Fragment
       host.oneVersionEnforcementUseTransitiveJarsForBinaryUnderTest =
           oneVersionEnforcementUseTransitiveJarsForBinaryUnderTest;
       host.persistentBusyboxTools = persistentBusyboxTools;
+
+      host.incompatibleProhibitAapt1 = incompatibleProhibitAapt1;
 
       // Unless the build was started from an Android device, host means MAIN.
       host.configurationDistinguisher = ConfigurationDistinguisher.MAIN;
@@ -1043,7 +979,6 @@ public class AndroidConfiguration extends BuildConfiguration.Fragment
   private final boolean useSingleJarApkBuilder;
   private final boolean compressJavaResources;
   private final boolean exportsManifestDefault;
-  private final AndroidAaptVersion androidAaptVersion;
   private final boolean useParallelDex2Oat;
   private final boolean breakBuildOnParallelDex2OatFailure;
   private final boolean omitResourcesInfoProviderFromAndroidBinary;
@@ -1058,9 +993,7 @@ public class AndroidConfiguration extends BuildConfiguration.Fragment
   private final boolean alwaysFilterDuplicateClassesFromAndroidTest;
   private final boolean filterLibraryJarWithProgramJar;
   private final boolean useRTxtFromMergedResources;
-
-  // Incompatible changes
-  private final boolean incompatibleUseAapt2ByDefault;
+  private final Label legacyMainDexListGenerator;
 
   private AndroidConfiguration(Options options) throws InvalidConfigurationException {
     this.sdk = options.sdk;
@@ -1108,27 +1041,17 @@ public class AndroidConfiguration extends BuildConfiguration.Fragment
     this.dataBindingUpdatedArgs = options.dataBindingUpdatedArgs;
     this.persistentBusyboxTools = options.persistentBusyboxTools;
     this.filterRJarsFromAndroidTest = options.filterRJarsFromAndroidTest;
-    this.incompatibleUseAapt2ByDefault = options.incompatibleUseAapt2ByDefault;
     this.removeRClassesFromInstrumentationTestJar =
         options.removeRClassesFromInstrumentationTestJar;
     this.alwaysFilterDuplicateClassesFromAndroidTest =
         options.alwaysFilterDuplicateClassesFromAndroidTest;
     this.filterLibraryJarWithProgramJar = options.filterLibraryJarWithProgramJar;
     this.useRTxtFromMergedResources = options.useRTxtFromMergedResources;
+    this.legacyMainDexListGenerator = options.legacyMainDexListGenerator;
 
-    // Make the value of --android_aapt aapt2 if --incompatible_use_aapt2_by_default is enabled
-    // and --android_aapt = AUTO
-    //
-    // We use the --incompatible_use_aapt2_by_default flag to signal a breaking change in Bazel.
-    // This is required by the Bazel Incompatible Changes policy.
-    //
-    // TODO(jingwen): We can remove the incompatible change flag only when the depot migration is
-    // complete and the default value of --android_aapt is switched from `auto` to `aapt2`.
-    if (options.incompatibleUseAapt2ByDefault
-        && options.androidAaptVersion == AndroidAaptVersion.AUTO) {
-      this.androidAaptVersion = AndroidAaptVersion.AAPT2;
-    } else {
-      this.androidAaptVersion = options.androidAaptVersion;
+    if (options.androidAaptVersion != AndroidAaptVersion.AAPT2) {
+      throw new InvalidConfigurationException(
+          "--android_aapt is no longer available for setting aapt version to aapt");
     }
 
     if (incrementalDexingShardsAfterProguard < 0) {
@@ -1270,10 +1193,6 @@ public class AndroidConfiguration extends BuildConfiguration.Fragment
     return useAndroidResourceNameObfuscation;
   }
 
-  public AndroidAaptVersion getAndroidAaptVersion() {
-    return androidAaptVersion;
-  }
-
   public AndroidManifestMerger getManifestMerger() {
     return manifestMerger;
   }
@@ -1356,10 +1275,6 @@ public class AndroidConfiguration extends BuildConfiguration.Fragment
     return persistentBusyboxTools;
   }
 
-  public boolean incompatibleChangeUseAapt2ByDefault() {
-    return incompatibleUseAapt2ByDefault;
-  }
-
   @Override
   public String getOutputDirectoryName() {
     return configurationDistinguisher.suffix;
@@ -1383,5 +1298,15 @@ public class AndroidConfiguration extends BuildConfiguration.Fragment
 
   boolean useRTxtFromMergedResources() {
     return useRTxtFromMergedResources;
+  }
+
+  /** Returns the label provided with --legacy_main_dex_list_generator, if any. */
+  // TODO(b/147692286): Move R8's main dex list tool into tool repository.
+  @SkylarkConfigurationField(
+      name = "legacy_main_dex_list_generator",
+      doc = "Returns the label provided with --legacy_main_dex_list_generator, if any.")
+  @Nullable
+  public Label getLegacyMainDexListGenerator() {
+    return legacyMainDexListGenerator;
   }
 }

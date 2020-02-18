@@ -99,7 +99,6 @@ public final class JavaConfiguration extends Fragment implements JavaConfigurati
   private final Label toolchainLabel;
   private final Label runtimeLabel;
   private final boolean explicitJavaTestDeps;
-  private final boolean experimentalTestRunner;
   private final boolean jplPropagateCcLinkParamsStore;
   private final boolean addTestSupportToCompileTimeDeps;
   private final boolean isJlplStrictDepsEnforced;
@@ -108,6 +107,7 @@ public final class JavaConfiguration extends Fragment implements JavaConfigurati
   private final boolean disallowResourceJars;
   private final boolean loadJavaRulesFromBzl;
   private final boolean disallowLegacyJavaToolchainFlags;
+  private final boolean experimentalTurbineAnnotationProcessing;
 
   // TODO(dmarting): remove once we have a proper solution for #2539
   private final boolean useLegacyBazelJavaTest;
@@ -140,7 +140,6 @@ public final class JavaConfiguration extends Fragment implements JavaConfigurati
     this.importDepsCheckingLevel = javaOptions.importDepsCheckingLevel;
     this.allowRuntimeDepsOnNeverLink = javaOptions.allowRuntimeDepsOnNeverLink;
     this.explicitJavaTestDeps = javaOptions.explicitJavaTestDeps;
-    this.experimentalTestRunner = javaOptions.experimentalTestRunner;
     this.jplPropagateCcLinkParamsStore = javaOptions.jplPropagateCcLinkParamsStore;
     this.isJlplStrictDepsEnforced = javaOptions.isJlplStrictDepsEnforced;
     this.disallowResourceJars = javaOptions.disallowResourceJars;
@@ -176,6 +175,8 @@ public final class JavaConfiguration extends Fragment implements JavaConfigurati
     this.requireJavaToolchainHeaderCompilerDirect =
         javaOptions.requireJavaToolchainHeaderCompilerDirect;
     this.disallowLegacyJavaToolchainFlags = javaOptions.disallowLegacyJavaToolchainFlags;
+    this.experimentalTurbineAnnotationProcessing =
+        javaOptions.experimentalTurbineAnnotationProcessing;
 
     if (javaOptions.disallowLegacyJavaToolchainFlags) {
       if (!javaOptions.javaBase.equals(javaOptions.defaultJavaBase())) {
@@ -350,13 +351,6 @@ public final class JavaConfiguration extends Fragment implements JavaConfigurati
     return useLegacyBazelJavaTest;
   }
 
-  /**
-   * Returns true if we should be the ExperimentalTestRunner instead of the BazelTestRunner for
-   * bazel's java_test runs.
-   */
-  public boolean useExperimentalTestRunner() {
-    return experimentalTestRunner;
-  }
 
   /**
    * Make it mandatory for java_test targets to explicitly declare any JUnit or Hamcrest
@@ -424,5 +418,9 @@ public final class JavaConfiguration extends Fragment implements JavaConfigurati
 
   public boolean loadJavaRulesFromBzl() {
     return loadJavaRulesFromBzl;
+  }
+
+  public boolean experimentalTurbineAnnotationProcessing() {
+    return experimentalTurbineAnnotationProcessing;
   }
 }

@@ -348,7 +348,7 @@ public class SkylarkImportLookupFunction implements SkyFunction {
     }
     Map<SkyKey, SkyValue> skylarkImportMap =
         (visitedNested == null)
-            ? computeSkylarkImportMapNoInlining(env, importLookupKeys, file.getLocation())
+            ? computeSkylarkImportMapNoInlining(env, importLookupKeys, file.getStartLocation())
             : computeSkylarkImportMapWithInlining(
                 env,
                 importLookupKeys,
@@ -471,7 +471,8 @@ public class SkylarkImportLookupFunction implements SkyFunction {
           loadMap.put(module, label);
         } catch (LabelSyntaxException ex) {
           handler.handle(
-              Event.error(load.getImport().getLocation(), "in load statement: " + ex.getMessage()));
+              Event.error(
+                  load.getImport().getStartLocation(), "in load statement: " + ex.getMessage()));
           ok = false;
         }
       }
@@ -506,7 +507,7 @@ public class SkylarkImportLookupFunction implements SkyFunction {
         skylarkImportMap.put(key, values.get(key).get());
       } catch (SkylarkImportFailedException exn) {
         throw new SkylarkImportFailedException(
-            "in " + locationForErrors.getPath() + ": " + exn.getMessage());
+            "in " + locationForErrors.file() + ": " + exn.getMessage());
       }
     }
     return env.valuesMissing() ? null : skylarkImportMap;
@@ -575,7 +576,7 @@ public class SkylarkImportLookupFunction implements SkyFunction {
 
   /** Creates the Extension to be imported. */
   private Extension createExtension(
-      StarlarkFile ast,
+      StarlarkFile file,
       Label extensionLabel,
       Map<String, Extension> importMap,
       StarlarkSemantics starlarkSemantics,
@@ -584,23 +585,21 @@ public class SkylarkImportLookupFunction implements SkyFunction {
       ImmutableMap<RepositoryName, RepositoryName> repositoryMapping)
       throws SkylarkImportFailedException, InterruptedException {
     StoredEventHandler eventHandler = new StoredEventHandler();
-    // TODO(bazel-team): this method overestimates the changes which can affect the
-    // Skylark RuleClass. For example changes to comments or unused functions can modify the hash.
-    // A more accurate - however much more complicated - way would be to calculate a hash based on
-    // the transitive closure of the accessible AST nodes.
+    // Any change to an input file may affect program behavior,
+    // even if only by changing line numbers in error messages.
     PathFragment extensionFile = extensionLabel.toPathFragment();
-    try (Mutability mutability = Mutability.create("importing %s", extensionFile)) {
-      StarlarkThread extensionThread =
+    try (Mutability mutability = Mutability.create("importing", extensionFile)) {
+      StarlarkThread thread =
           ruleClassProvider.createRuleClassStarlarkThread(
               extensionLabel,
               mutability,
               starlarkSemantics,
-              eventHandler,
-              ast.getContentHashCode(),
+              StarlarkThread.makeDebugPrintHandler(eventHandler),
+              file.getContentHashCode(),
               importMap,
+              packageFactory.getNativeModule(inWorkspace),
               repositoryMapping);
-      extensionThread.setupOverride("native", packageFactory.getNativeModule(inWorkspace));
-      execAndExport(ast, extensionLabel, eventHandler, extensionThread);
+      execAndExport(file, extensionLabel, eventHandler, thread);
 
       Event.replayEventsOn(env.getListener(), eventHandler.getEvents());
       for (Postable post : eventHandler.getPosts()) {
@@ -609,7 +608,7 @@ public class SkylarkImportLookupFunction implements SkyFunction {
       if (eventHandler.hasErrors()) {
         throw SkylarkImportFailedException.errors(extensionFile);
       }
-      return new Extension(extensionThread);
+      return new Extension(thread);
     }
   }
 
@@ -636,7 +635,7 @@ public class SkylarkImportLookupFunction implements SkyFunction {
         });
 
     try {
-      EvalUtils.exec(file, thread);
+      EvalUtils.exec(file, thread.getGlobals(), thread);
     } catch (EvalException ex) {
       handler.handle(Event.error(ex.getLocation(), ex.getMessage()));
     }

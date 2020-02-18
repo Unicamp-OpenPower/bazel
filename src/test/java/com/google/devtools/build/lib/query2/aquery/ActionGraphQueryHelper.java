@@ -16,17 +16,21 @@ package com.google.devtools.build.lib.query2.aquery;
 import com.google.common.collect.ImmutableList;
 import com.google.devtools.build.lib.query2.PostAnalysisQueryEnvironment;
 import com.google.devtools.build.lib.query2.PostAnalysisQueryEnvironment.TopLevelConfigurations;
-import com.google.devtools.build.lib.query2.PostAnalysisQueryHelper;
 import com.google.devtools.build.lib.query2.engine.QueryEnvironment.QueryFunction;
+import com.google.devtools.build.lib.query2.testutil.PostAnalysisQueryHelper;
 import com.google.devtools.build.lib.skyframe.ConfiguredTargetValue;
+import com.google.devtools.build.skyframe.SkyKey;
 import com.google.devtools.build.skyframe.WalkableGraph;
+import java.util.Collection;
 
 /** Helper class for aquery test */
 public class ActionGraphQueryHelper extends PostAnalysisQueryHelper<ConfiguredTargetValue> {
 
   @Override
   protected PostAnalysisQueryEnvironment<ConfiguredTargetValue> getPostAnalysisQueryEnvironment(
-      WalkableGraph walkableGraph, TopLevelConfigurations topLevelConfigurations) {
+      WalkableGraph walkableGraph,
+      TopLevelConfigurations topLevelConfigurations,
+      Collection<SkyKey> transitiveConfigurationKeys) {
     ImmutableList<QueryFunction> extraFunctions =
         ImmutableList.copyOf(ActionGraphQueryEnvironment.AQUERY_FUNCTIONS);
     return new ActionGraphQueryEnvironment(
